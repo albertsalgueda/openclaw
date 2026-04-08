@@ -25,6 +25,8 @@ const MULTIPASS_REPO_SYNC_EXCLUDES = [
   "coverage",
   "*.heapsnapshot",
 ] as const;
+const MULTIPASS_EXEC_MAX_BUFFER = 64 * 1024 * 1024;
+const MULTIPASS_GUEST_RUN_TIMEOUT_MS = 60 * 60 * 1000;
 
 const QA_LIVE_ENV_ALIASES = Object.freeze([
   {
@@ -75,6 +77,10 @@ export const qaMultipassDefaultResources = {
 type ExecResult = {
   stdout: string;
   stderr: string;
+};
+
+type ExecFileOptions = {
+  timeoutMs?: number;
 };
 
 export type QaMultipassPlan = {
@@ -136,17 +142,74 @@ function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function execFileAsync(file: string, args: string[]) {
+function execFileAsync(file: string, args: string[], options: ExecFileOptions = {}) {
   return new Promise<ExecResult>((resolve, reject) => {
-    execFile(file, args, { encoding: "utf8" }, (error, stdout, stderr) => {
-      if (error) {
-        const message = stderr.trim() || stdout.trim() || error.message;
-        reject(new Error(message));
-        return;
-      }
-      resolve({ stdout, stderr });
-    });
+    execFile(
+      file,
+      args,
+      {
+        encoding: "utf8",
+        maxBuffer: MULTIPASS_EXEC_MAX_BUFFER,
+        timeout: options.timeoutMs,
+      },
+      (error, stdout, stderr) => {
+        if (error) {
+          const message = stderr.trim() || stdout.trim() || error.message;
+          reject(new Error(message));
+          return;
+        }
+        resolve({ stdout, stderr });
+      },
+    );
   });
+}
+
+function resolveRealPath(value: string) {
+  return fs.realpathSync.native?.(value) ?? fs.realpathSync(value);
+}
+
+function resolveExistingPath(value: string) {
+  let currentPath = value;
+  while (!fs.existsSync(currentPath)) {
+    const parentPath = path.dirname(currentPath);
+    if (parentPath === currentPath) {
+      throw new Error(`unable to resolve existing path for ${value}`);
+    }
+    currentPath = parentPath;
+  }
+  return currentPath;
+}
+
+function isPathInside(parentPath: string, childPath: string) {
+  const relativePath = path.relative(parentPath, childPath);
+  return !relativePath.startsWith("..") && !path.isAbsolute(relativePath);
+}
+
+function validatePnpmVersion(version: string) {
+  if (!/^[0-9A-Za-z.+_-]+$/u.test(version)) {
+    throw new Error(`unsupported pnpm version in packageManager: ${version}`);
+  }
+  return version;
+}
+
+function resolveMountedOutputPath(repoRoot: string, hostPath: string) {
+  const relativePath = path.relative(repoRoot, hostPath);
+  if (relativePath.startsWith("..") || path.isAbsolute(relativePath) || relativePath.length === 0) {
+    throw new Error(
+      `qa suite --runner multipass requires --output-dir to stay under the repo root (${repoRoot}), got ${hostPath}.`,
+    );
+  }
+
+  const realRepoRoot = resolveRealPath(repoRoot);
+  const existingHostPath = resolveExistingPath(hostPath);
+  const realExistingHostPath = resolveRealPath(existingHostPath);
+  if (!isPathInside(realRepoRoot, realExistingHostPath) && realExistingHostPath !== realRepoRoot) {
+    throw new Error(
+      `qa suite --runner multipass requires --output-dir to stay under the repo root (${repoRoot}), got ${hostPath}.`,
+    );
+  }
+
+  return path.posix.join(MULTIPASS_MOUNTED_REPO_PATH, ...relativePath.split(path.sep));
 }
 
 function resolvePnpmVersion(repoRoot: string) {
@@ -196,7 +259,8 @@ function resolveLiveProviderConfigPath(env: NodeJS.ProcessEnv = process.env) {
 function resolveQaLiveCliAuthEnv(baseEnv: NodeJS.ProcessEnv) {
   const configuredCodexHome = baseEnv.CODEX_HOME?.trim();
   if (configuredCodexHome) {
-    return { CODEX_HOME: resolveUserPath(configuredCodexHome, baseEnv) };
+    const codexHome = resolveUserPath(configuredCodexHome, baseEnv);
+    return fs.existsSync(codexHome) ? { CODEX_HOME: codexHome } : {};
   }
   const hostHome = baseEnv.HOME?.trim();
   if (!hostHome) {
@@ -232,13 +296,7 @@ function createQaMultipassOutputDir(repoRoot: string) {
 }
 
 function resolveGuestMountedPath(repoRoot: string, hostPath: string) {
-  const relativePath = path.relative(repoRoot, hostPath);
-  if (relativePath.startsWith("..") || path.isAbsolute(relativePath) || relativePath.length === 0) {
-    throw new Error(
-      `qa suite --runner multipass requires --output-dir to stay under the repo root (${repoRoot}), got ${hostPath}.`,
-    );
-  }
-  return path.posix.join(MULTIPASS_MOUNTED_REPO_PATH, ...relativePath.split(path.sep));
+  return resolveMountedOutputPath(repoRoot, hostPath);
 }
 
 function appendScenarioArgs(command: string[], scenarioIds: string[]) {
@@ -304,7 +362,7 @@ export function createQaMultipassPlan(params: {
     cpus: params.cpus ?? qaMultipassDefaultResources.cpus,
     memory: params.memory ?? qaMultipassDefaultResources.memory,
     disk: params.disk ?? qaMultipassDefaultResources.disk,
-    pnpmVersion: resolvePnpmVersion(params.repoRoot),
+    pnpmVersion: validatePnpmVersion(resolvePnpmVersion(params.repoRoot)),
     providerMode,
     primaryModel: params.primaryModel,
     alternateModel: params.alternateModel,
@@ -355,7 +413,7 @@ export function renderQaMultipassGuestScript(plan: QaMultipassPlan) {
   const lines = [
     "#!/usr/bin/env bash",
     "set -euo pipefail",
-    "trap 'status=$?; echo \"guest failure: ${BASH_COMMAND} (exit ${status})\" >&2; exit ${status}' ERR",
+    "trap 'status=$?; echo \"guest failure (exit ${status})\" >&2; exit ${status}' ERR",
     "",
     "export DEBIAN_FRONTEND=noninteractive",
     `BOOTSTRAP_LOG=${shellQuote(plan.guestBootstrapLogPath)}`,
@@ -406,7 +464,7 @@ export function renderQaMultipassGuestScript(plan: QaMultipassPlan) {
     "",
     "ensure_pnpm() {",
     '  sudo env PATH="/usr/local/bin:/usr/bin:/bin" corepack enable >>"$BOOTSTRAP_LOG" 2>&1',
-    `  sudo env PATH="/usr/local/bin:/usr/bin:/bin" corepack prepare pnpm@${plan.pnpmVersion} --activate >>"$BOOTSTRAP_LOG" 2>&1`,
+    `  sudo env PATH="/usr/local/bin:/usr/bin:/bin" corepack prepare ${shellQuote(`pnpm@${plan.pnpmVersion}`)} --activate >>"$BOOTSTRAP_LOG" 2>&1`,
     "}",
     "",
     'command -v sudo >/dev/null || { echo "missing sudo in guest" >&2; exit 1; }',
@@ -435,9 +493,9 @@ async function appendMultipassLog(logPath: string, message: string) {
   await appendFile(logPath, message, "utf8");
 }
 
-async function runMultipassCommand(logPath: string, args: string[]) {
+async function runMultipassCommand(logPath: string, args: string[], options: ExecFileOptions = {}) {
   await appendMultipassLog(logPath, `$ ${["multipass", ...args].join(" ")}\n`);
-  const result = await execFileAsync("multipass", args);
+  const result = await execFileAsync("multipass", args, options);
   if (result.stdout.trim()) {
     await appendMultipassLog(logPath, `${result.stdout.trim()}\n`);
   }
@@ -562,7 +620,10 @@ export async function runQaMultipass(params: {
     `# OpenClaw QA Multipass host log\nvmName=${plan.vmName}\noutputDir=${plan.outputDir}\n\n`,
     "utf8",
   );
-  await writeFile(plan.hostGuestScriptPath, renderQaMultipassGuestScript(plan), "utf8");
+  await writeFile(plan.hostGuestScriptPath, renderQaMultipassGuestScript(plan), {
+    encoding: "utf8",
+    mode: 0o600,
+  });
 
   try {
     await execFileAsync("multipass", ["version"]);
@@ -606,7 +667,9 @@ export async function runQaMultipass(params: {
       "+x",
       plan.guestScriptPath,
     ]);
-    await runMultipassCommand(plan.hostLogPath, ["exec", plan.vmName, "--", plan.guestScriptPath]);
+    await runMultipassCommand(plan.hostLogPath, ["exec", plan.vmName, "--", plan.guestScriptPath], {
+      timeoutMs: MULTIPASS_GUEST_RUN_TIMEOUT_MS,
+    });
     await tryCopyGuestBootstrapLog(plan);
   } catch (error) {
     if (launched) {

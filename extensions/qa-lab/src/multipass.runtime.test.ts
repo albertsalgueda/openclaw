@@ -1,3 +1,5 @@
+import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createQaMultipassPlan, renderQaMultipassGuestScript } from "./multipass.runtime.js";
@@ -14,6 +16,32 @@ describe("qa multipass runtime", () => {
         outputDir: "/tmp/qa-out",
       }),
     ).toThrow("qa suite --runner multipass requires --output-dir to stay under the repo root");
+  });
+
+  it("rejects repo-local symlink output directories that escape the repo root", () => {
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-multipass-"));
+    const repoRoot = path.join(tempRoot, "repo");
+    const outsideRoot = path.join(tempRoot, "outside");
+    const symlinkPath = path.join(repoRoot, "artifacts-link");
+    fs.mkdirSync(repoRoot, { recursive: true });
+    fs.mkdirSync(outsideRoot, { recursive: true });
+    fs.writeFileSync(
+      path.join(repoRoot, "package.json"),
+      JSON.stringify({ packageManager: "pnpm@10.32.1" }),
+      "utf8",
+    );
+    fs.symlinkSync(outsideRoot, symlinkPath);
+
+    try {
+      expect(() =>
+        createQaMultipassPlan({
+          repoRoot,
+          outputDir: path.join(symlinkPath, "qa-out"),
+        }),
+      ).toThrow("qa suite --runner multipass requires --output-dir to stay under the repo root");
+    } finally {
+      fs.rmSync(tempRoot, { recursive: true, force: true });
+    }
   });
 
   it("reuses suite scenario semantics and resolves mounted artifact paths", () => {
@@ -43,6 +71,7 @@ describe("qa multipass runtime", () => {
 
     expect(script).toContain("pnpm install --frozen-lockfile");
     expect(script).toContain("pnpm build");
+    expect(script).toContain("corepack prepare 'pnpm@10.32.1' --activate");
     expect(script).toContain("'pnpm' 'openclaw' 'qa' 'suite' '--provider-mode' 'mock-openai'");
     expect(script).toContain("'--scenario' 'channel-chat-baseline'");
     expect(script).toContain("'--scenario' 'thread-follow-up'");
@@ -77,5 +106,18 @@ describe("qa multipass runtime", () => {
     expect(plan.forwardedEnv.OPENAI_API_KEY).toBe("test-openai-key");
     expect(script).toContain("OPENAI_API_KEY='test-openai-key'");
     expect(script).toContain("'pnpm' 'openclaw' 'qa' 'suite' '--provider-mode' 'live-frontier'");
+  });
+
+  it("skips stale CODEX_HOME values that do not exist on the host", () => {
+    vi.stubEnv("CODEX_HOME", "/tmp/does-not-exist-openclaw-codex-home");
+    const plan = createQaMultipassPlan({
+      repoRoot: process.cwd(),
+      outputDir: path.join(process.cwd(), ".artifacts", "qa-e2e", "multipass-live-test"),
+      providerMode: "live-frontier",
+    });
+
+    expect(plan.forwardedEnv.CODEX_HOME).toBeUndefined();
+    expect(plan.hostCodexHomePath).toBeUndefined();
+    expect(plan.guestCodexHomePath).toBeUndefined();
   });
 });
